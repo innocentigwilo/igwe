@@ -1,0 +1,93 @@
+name: Windows RDP via Tailscale
+
+on:
+  workflow_dispatch: # Allow manual triggering
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    # timeout-minutes is removed. It will run until GitHub's hard limit (6 hours) kills it.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. INSTALL TAILSCALE
+      - name: Install Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAISCALE_AUTH_KEY }}
+          # Do NOT use tags unless you have configured them in your Tailscale ACLs.
+
+      # 2. ENABLE RDP, OPEN FIREWALL, & DISABLE NLA
+      - name: Enable RDP and Set Password
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          
+          # Disable Network Level Authentication (NLA) - crucial for some connections
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          
+          # Force open Port 3389 explicitly (More reliable than group names)
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue
+          
+          # Restart the Remote Desktop Service to apply changes
+          Restart-Service -Name TermService -Force
+          
+          # Set a strong password for the runneradmin user
+          net user runneradmin "RdpPass!2024#Secure"
+
+      # 3. GET TAILSCALE IP
+      - name: Get Tailscale IP and Set Environment Variable
+        id: get_ip
+        shell: pwsh
+        run: |
+          # Get the Tailscale IPv4 address of the current machine
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          
+          # Retry logic to ensure Tailscale has fully initialized
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 5) {
+              Start-Sleep -Seconds 5
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          # Write to GitHub environment variables for subsequent steps
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP obtained: $tsIP"
+
+      # 4. VERIFY RDP
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          # Test whether port 3389 is listening
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful! RDP is ready."
+
+      # 5. KEEP RUNNER ALIVE & SHOW INFO
+      - name: Maintain Connection & Show Info
+        shell: pwsh
+        run: |
+          Write-Host "`n========================================="
+          Write-Host "=== RDP ACCESS DETAILS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: runneradmin"
+          Write-Host "Password: RdpPass!2024#Secure"
+          Write-Host "=========================================`n"
+
+          # Infinite loop to keep the runner active
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Cancel workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
